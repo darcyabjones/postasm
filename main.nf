@@ -12,9 +12,11 @@ def helpMessage() {
     """.stripIndent()
 }
 
-
+params.reference = false
+params.genes = false
 params.assemblies = false
-params.table = false
+params.reads = false
+params.bams = false
 params.map = false
 params.nobusco = false
 params.busco_lineage = false
@@ -33,6 +35,16 @@ static String lcp(String r1, String r2){
         .collect {it[0]}
         .join("")
     return l.replaceAll(/[-\._]$/, "")
+}
+
+
+def checkNotNull = { field, parameter, row  ->
+    if (row.name == null || row.name == '') {
+        log.info "Encountered empty value in ${field} column of ${parameter} table."
+        log.info "Please make sure no required values are empty."
+        exit 1
+    }
+    row
 }
 
 
@@ -62,123 +74,188 @@ if ( params.sourmashdb ) {
     }
 }
 
-if ( params.table ) {
-    table = Channel.fromPath(params.table, checkIfExists: true)
-        .splitCsv(by: 1, sep: '\t', header: true)
-        .filter { it.assembly != null && it.read1_file != null && it.read2_file != null }
-        .map {[
-            it.assembly,
-            file(it.read1_file, checkIfExists: true),
-            file(it.read2_file, checkIfExists: true)
-        ]}
-
-    table.into {
-        table4AssemblyChannel;
-        table4Align;
-        table4Kat;
-        table4FilterLength;
-    }
-}
-
-
 if ( params.assemblies ) {
-    assemblies = Channel
-        .fromPath(params.assemblies, checkIfExists: true, type: "file")
-        .map { file -> [file.name, file] }
-} else if ( params.table ) {
-    assemblies = table4AssemblyChannel
-        .unique { asm, r1, r2 -> asm}
-        .map { asm, r1, r2 -> [asm, file(asm, checkIfExists: true)] }
+    Channel.fromPath(params.assemblies, checkIfExists: true)
+        .splitCsv(by: 1, sep: '\t', header: true)
+        .into {
+            assemblies4Scaffolds;
+            assemblies4Contigs;
+            assemblies4ScaffoldsAndContigs;
+            assemblies4Mitochondria;
+        }
+
+    scaffolds = assemblies4Scaffolds
+        .filter { it.scaffolds != null }
+        .map { checkNotNull("name", "assemblies", it) }
+        .map { [it.name, file(it.scaffolds, checkIfExists: true)] }
+        .unique()
+
+    contigs = assemblies4Contigs
+        .filter { it.contigs != null }
+        .map { checkNotNull("name", "assemblies", it) }
+        .map { [it.name, file(it.contigs, checkIfExists: true)] }
+        .unique()
+
+    scaffoldsAndContigs = assemblies4ScaffoldsAndContigs
+        .filter { it.scaffolds != null && it.contigs != null }
+        .map { checkNotNull("name", "assemblies", it) }
+        .map {[
+            it.name,
+            file(it.scaffolds, checkIfExists: true),
+            file(it.contigs, checkIfExists: true)
+        ]}
+        .unique()
+
+    mitochondria = assemblies4Mitochondria
+        .filter { it.mitochondria != null }
+        .map { checkNotNull("name", "assemblies", it) }
+        .map { [it.name, file(it.mitochondria, checkIfExists: true)] }
+        .unique()
 } else {
-    log.info "Hey I need some assemblies to assess."
+    log.info "Hey I need some assemblies to assess please."
     exit 1
 }
 
-assemblies.into {
-    assemblies4Stats;
-    assemblies4Busco;
-    assemblies4Sourmash;
-    assemblies4AlignContigs;
-    assemblies4FilterCoveredContigs;
-    assemblies4Align;
-    assemblies4FilterLength;
+
+if ( params.reads ) {
+    reads = Channel.fromPath(params.reads, checkIfExists: true)
+        .splitCsv(by: 1, sep: '\t', header: true)
+        .filter { it.read1_file != null && it.read2_file != null }
+        .map { checkNotNull("name", "reads", it) }
+        .map {[
+            it.name,
+            file(it.read1_file, checkIfExists: true),
+            file(it.read2_file, checkIfExists: true)
+        ]}
+        .unique()
+} else {
+    reads = Channel.empty()
+}
+
+
+if ( params.bams ) {
+    bams = Channel.fromPath(params.bams, checkIfExists: true)
+        .splitCsv(by: 1, sep: '\t', header: true)
+        .filter { it.bam != null }
+        .map { checkNotNull("name", "bams", it) }
+        .map { [it.name, file(it.bam, checkIfExists: true)] }
+        .unique()
+} else {
+    bams = Channel.empty()
+}
+
+// End of input validation
+
+
+scaffolds.into {
+    scaffolds4JoinWithContigs;
+    scaffolds4FilterLength;
+}
+
+// This is different to scaffoldsAndContigs because it is long format
+// rather than wide format.
+scaffolds4JoinWithContigs
+    .map {n, f -> [n, "scaffolds", f]}
+    .concat( contigs.map {n, f -> [n, "contigs", f]} )
+    .into {
+        scafsCatContigs4AssemblyStats;
+        scafsCatContigs4RunBusco;
+        scafsCatContigs4AlignReads;
+        scafsCatContigs4FindMitochondrial;
+    }
+
+
+mitochondria.into {
+    mitochondria4AssemblyStats;
+    mitochondria4FindMitochondrial;
+}
+
+reads.into {
+    reads4AssemblySpectra;
+    reads4AlignReads;
 }
 
 
 process assemblyStats {
 
     label "bbmap"
-    tag { name }
+    tag "${name} - ${type}"
     publishDir "${params.outdir}/asm_stats"
 
     input:
-    set val(name), file(fasta) from assemblies4Stats
+    set val(name), val(type), file(fasta) from scafsCatContigs4AssemblyStats
+        .concat (
+            mitochondria4AssemblyStats.map {n, f -> [n, "mitochondria", f]}
+        )
 
     output:
-    set val(name),
-        file("${fasta.simpleName}_gc.txt"),
-        file("${fasta.simpleName}_gchist.txt"),
-        file("${fasta.simpleName}_shist.txt"),
-        file("${fasta.simpleName}_stats.txt") into assemblyStatsResults
+    set val(name), val(type),
+        file("${fasta.simpleName}_${type}_gc.txt"),
+        file("${fasta.simpleName}_${type}_gchist.txt"),
+        file("${fasta.simpleName}_${type}_shist.txt"),
+        file("${fasta.simpleName}_${type}_stats.txt") into assemblyStatsResults
 
     // TODO add extra columns for sample and concatenation step.
     """
     stats.sh \
       in=${fasta} \
-      gc=${fasta.simpleName}_gc.txt \
-      gchist=${fasta.simpleName}_gchist.txt \
-      shist=${fasta.simpleName}_shist.txt \
+      gc=${fasta.simpleName}_${type}_gc.txt \
+      gchist=${fasta.simpleName}_${type}_gchist.txt \
+      shist=${fasta.simpleName}_${type}_shist.txt \
       extended=t \
       score=t \
       format=3 \
       gcformat=1 \
-    > ${fasta.simpleName}_stats.txt
+    | awk -v fname="${name}" \
+      'BEGIN {OFS="\t"} NR == 1 {print "name", $0} NR == 2 {print fname, $0}'
+    > ${fasta.simpleName}_${type}_stats.txt
     """
 }
 
+process combineAssemblyStats {
+    label "posix"
+    label { type }
+    publishDir "${params.outdir}/asm_stats"
+
+    input:
+    set val(type), file("*_stats.txt") from assemblyStatsResults
+        .map { n, t, gc, gch, sh, st -> [t, st] }
+        .groupTuple(by: 0)
+
+    output:
+    set val(type), file("${type}_stats.tsv") into combinedAssemblyStatsResults
+
+    """
+    array=( *_stats.txt )
+    { cat \${array[@]:0:1}; tail -n+2 --quiet \${array[@]:1}; } > ${type}_stats.tsv
+    """
+}
 
 process alignContigs {
     label "mummer"
     tag { name }
-    publishDir "${params.outdir}/asm_self_aligned"
+    publishDir "${params.outdir}/asm_align_contigs_to_scaffolds"
 
     input:
-    set val(name), file(fasta) from assemblies4AlignContigs
+    set val(name), file(scaffolds), file(contigs) from scaffoldsAndContigs
 
     output:
-    set val(name), file("${name}.delta"), file("${name}.coords") into alignedContigs
+    set val(name), file("${name}.delta"), file("${name}.coords"), file("${name}.sam") into alignedContigs
 
     """
     nucmer \
       --maxmatch \
-      --nosimplify \
       --threads ${task.cpus} \
-      --prefix ${name} \
-      ${fasta} \
-      ${fasta}
+      --delta "${name}.delta" \
+      --sam-long "${name}.sam" \
+      ${scaffolds} \
+      ${contigs}
 
     show-coords -T -c -l -H ${name}.delta > ${name}.coords
     """
 }
 
-
-process filterCoveredContigs {
-    label "python3"
-    tag { name }
-    publishDir "${params.outdir}/asm_self_aligned"
-
-    input:
-    set val(name), file(fasta) from assemblies4FilterCoveredContigs
-    set val(name), file("${name}.delta"), file("${name}.coords") from alignedContigs
-
-    output:
-    set val(name), file("${name}.summary"), file("${name}.filtered") into filteredContigs
-
-
-}
-
-
-if ( params.table ) {
+if ( params.reads ) {
 
     // We run this several times to see if filtering by contig
     // length results in loss of information.
@@ -192,7 +269,7 @@ if ( params.table ) {
         publishDir "${params.outdir}/asm_spectra/filtered_fastas"
 
         input:
-        set val(name), file(asm) from assemblies4FilterLength
+        set val(name), file(asm) from scaffolds4FilterLength
         each threshold from thresholds
 
         output:
@@ -208,7 +285,7 @@ if ( params.table ) {
     }
 
     joined4KatSpectra = filtered4KatSpectra
-        .combine(table4Kat, by: 0)
+        .combine(reads4AssemblySpectra, by: 0)
 
     // Analyse kmer content in different spectra
     //
@@ -216,7 +293,7 @@ if ( params.table ) {
     // https://kat.readthedocs.io/en/latest/walkthrough.html#in-assemblies
     process assemblySpectra {
         label "kat"
-        tag { "${name} - ${thres}" }
+        tag "${name} - ${thres}"
         publishDir "${params.outdir}/asm_spectra"
 
         input:
@@ -247,7 +324,6 @@ if ( params.table ) {
   }
 }
 
-
 if ( !params.nobusco && params.busco_lineage ) {
 
     // Be careful using busco to compare assemblies.
@@ -255,11 +331,11 @@ if ( !params.nobusco && params.busco_lineage ) {
     // which in turn depend on the input (i.e. assemblies).
     process runBusco {
         label "busco"
-        tag { name }
-        publishDir "${params.outdir}/asm_busco"
+        tag "${name} - ${type}"
+        publishDir "${params.outdir}/asm_busco/${type}"
 
         input:
-        set val(name), file(fasta) from assemblies4Busco
+        set val(name), val(type), file(fasta) from scafsCatContigs4RunBusco
         file "lineage" from buscoLineage
 
         output:
@@ -294,7 +370,7 @@ if ( !params.nobusco && params.busco_lineage ) {
 }
 
 
-if ( params.table && params.map) {
+if ( params.reads && params.map) {
 
     /*
      * Align reads to assemblies and collect stats.
@@ -303,18 +379,19 @@ if ( params.table && params.map) {
         label "bbmap"
         label "biggish_task"
 
-        publishDir "${params.outdir}/asm_self_aligned"
+        publishDir "${params.outdir}/asm_read_aligned/${type}"
 
-        tag { "${name}" }
+        tag "${name} - ${type}"
 
         input:
-        set val(name), file(asm), file("*R1.fastq"), file("*R2.fastq") from assemblies4Align
-            .combine(table4Align, by: 0)
+        set val(name), val(type), file(asm),
+            file("*R1.fastq"), file("*R2.fastq") from scafsCatContigs4AlignReads
+            .combine(reads4AlignReads, by: 0)
             .groupTuple(by: [0, 1])
 
         output:
-        set val(name), file("${asm.simpleName}.sam") into alignedReads
-        set val(name), file("*.txt") into alignedStats
+        set val(name), val(type), file("${asm.simpleName}.sam") into alignedReads
+        set val(name), val(type), file("*.txt") into alignedStats
 
         """
         # Figure out it the file is compressed or not.
@@ -381,15 +458,16 @@ if ( params.table && params.map) {
         label "samtools"
         label "small_task"
 
-        publishDir "${params.outdir}/asm_self_aligned"
+        publishDir "${params.outdir}/asm_read_aligned/${type}"
 
-        tag { "${name}" }
+        tag "${name} - ${type}"
 
         input:
-        set val(name), file(sam) from alignedReads
+        set val(name), val(type), file(sam) from alignedReads
 
         output:
         set val(name),
+            val(type),
             file("${sam.simpleName}.idxstats"),
             file("${sam.simpleName}.flagstat"),
             file("${sam.simpleName}.stats") into samtoolsStats
@@ -406,8 +484,8 @@ if ( params.table && params.map) {
     }
 
     joined4AlignmentMultiQC = samtoolsStats
-        .flatMap { r, i, f, s -> [i, f, s] }
-        .concat(alignedStats.flatMap { r, s -> s })
+        .flatMap { n, t, i, f, s -> [[t, i], [t, f], [t, s]] }
+        .concat(alignedStats.flatMap { n, t, s -> s.collect {f -> [t, f]} })
         .filter { f -> !f.name.endsWith("qhist.txt") }
         .filter { f -> !f.name.endsWith("qahist.txt") }
 
@@ -418,13 +496,16 @@ if ( params.table && params.map) {
         label "multiqc"
         label "small_task"
 
-        publishDir "${params.outdir}/asm_self_aligned"
+        publishDir "${params.outdir}/asm_read_aligned/${type}"
 
         input:
-        file "*" from joined4AlignmentMultiQC.collect()
+        set val(type), file("*") from joined4AlignmentMultiQC
+            .groupTuple(by: 0)
 
         output:
-        set file("multiqc.html"), file("multiqc_data") into alignmentMultiQCResults
+        set val(type),
+            file("multiqc.html"),
+            file("multiqc_data") into alignmentMultiQCResults
 
         """
         multiqc . --filename "multiqc"
